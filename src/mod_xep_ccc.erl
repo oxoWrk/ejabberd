@@ -62,7 +62,7 @@
 -export([get_stanza_id/2, get_stanza_id_from_counter/5, get_user_cards/4,update_mam_prefs/3]).
 
 % syncronization_query hook
--export([create_synchronization_metadata/11, check_conversation_type/11, get_invite_information/4]).
+-export([create_synchronization_metadata/12, get_invite_information/4]).
 -type c2s_state() :: ejabberd_c2s:state().
 
 %% Delete after updating servers
@@ -135,6 +135,7 @@
 }).
 
 -define(TABLE_SIZE_LIMIT, 2000000000). % A bit less than 2 GiB.
+-define(NS_XABBER_SYNCHRONIZATION_CHAT, <<"https://xabber.com/protocol/synchronization#chat">>).
 %%--------------------------------------------------------------------
 %% gen_mod callbacks.
 %%--------------------------------------------------------------------
@@ -226,18 +227,18 @@ handle_cast({sm, #presence{type = available,from = #jid{lserver = PServer, luser
   IsChannel = xmpp:get_subtag(PktNew, #channel_x{xmlns = ?NS_CHANNELS}),
   Conversation = jid:to_string(jid:make(PUser,PServer)),
   {NewType, X} = if
-                  IsChat =/= false -> {<<"groupchat">>, IsChat} ;
+                  IsChat =/= false -> {?NS_GROUPCHAT, IsChat} ;
                   IsChannel =/= false -> {<<"channel">>, IsChannel};
-                  true -> {<<"chat">>, <<>>}
+                  true -> {?NS_XABBER_SYNCHRONIZATION_CHAT, <<>>}
                 end,
   CurrentType = get_conversation_type(LServer,LUser,Conversation),
   if
     NewType == CurrentType ->
       pass;
-    NewType == <<"groupchat">> orelse NewType == <<"channel">> ->
+    NewType == ?NS_GROUPCHAT orelse NewType == <<"channel">> ->
       update_mam_prefs(add,jid:make(LUser,LServer),jid:make(PUser,PServer)),
       update_metainfo(NewType, LServer,LUser,Conversation,X);
-    NewType == <<"chat">> ->
+    NewType == ?NS_XABBER_SYNCHRONIZATION_CHAT ->
       update_mam_prefs(remove,jid:make(LUser,LServer),jid:make(PUser,PServer)),
       update_metainfo(NewType, LServer,LUser,Conversation,X);
     true ->
@@ -246,17 +247,22 @@ handle_cast({sm, #presence{type = available,from = #jid{lserver = PServer, luser
   {noreply, State};
 handle_cast({sm, #presence{type = subscribe,from = From, to = #jid{lserver = LServer, luser = LUser}} = Presence},State) ->
   X = xmpp:get_subtag(Presence, #xabbergroupchat_x{xmlns = ?NS_GROUPCHAT}),
-  Type = case X of
-           false ->
-             ejabberd_hooks:run(xabber_push_notification,
-               LServer, [<<"subscribe">>, LUser, LServer, #presence{type = subscribe, from = From}]),
-             <<"chat">>;
-           _ ->
-             Privacy = get_privacy(xmpp:get_subtag(X, #xabbergroupchat_privacy{})),
-             erlang:iolist_to_binary([?NS_GROUPCHAT,<<"#">>,Privacy])
-         end,
+  {Type, GroupInfo} = case X of
+                         false ->
+                           ejabberd_hooks:run(xabber_push_notification,
+                             LServer, [<<"subscribe">>, LUser, LServer, #presence{type = subscribe, from = From}]),
+                           {?NS_XABBER_SYNCHRONIZATION_CHAT, <<>>};
+                         _ ->
+                           Privacy = get_privacy(xmpp:get_subtag(X, #xabbergroupchat_privacy{})),
+                           Parent = X#xabbergroupchat_x.parent,
+                           Info = case Parent of
+                                    undefined -> Privacy;
+                                    _ -> <<Privacy/binary,$,,(jid:to_string(Parent))/binary>>
+                                  end,
+                           {?NS_GROUPCHAT, Info}
+                       end,
   Conversation = jid:to_string(jid:remove_resource(From)),
-  create_conversation(LServer,LUser,Conversation,<<"">>,false,Type),
+  create_conversation(LServer,LUser,Conversation,<<"">>,false,Type,GroupInfo),
   {noreply, State};
 handle_cast({sm, #presence{type = unsubscribe,from = #jid{lserver = PServer, luser = PUser}, to = #jid{lserver = LServer, luser = LUser}}},State) ->
   maybe_delete_invite_and_conversation(LUser,LServer,PUser,PServer),
@@ -278,8 +284,6 @@ code_change(_OldVsn, State, _Extra) ->
 %%--------------------------------------------------------------------
 register_hooks(Host) ->
   ejabberd_hooks:add(syncronization_query, Host, ?MODULE,
-    check_conversation_type, 50),
-  ejabberd_hooks:add(syncronization_query, Host, ?MODULE,
     create_synchronization_metadata, 60),
   ejabberd_hooks:add(groupchat_send_message, Host, ?MODULE,
     groupchat_send_message, 10),
@@ -293,8 +297,6 @@ register_hooks(Host) ->
     c2s_stream_features, 50).
 
 unregister_hooks(Host) ->
-  ejabberd_hooks:delete(syncronization_query, Host, ?MODULE,
-    check_conversation_type, 50),
   ejabberd_hooks:delete(syncronization_query, Host, ?MODULE,
     create_synchronization_metadata, 60),
   ejabberd_hooks:delete(groupchat_send_message, Host, ?MODULE,
@@ -468,7 +470,6 @@ process_iq(#iq{from = #jid{luser = LUser, lserver = LServer}, type = set,
     sub_els =[#xabber_conversation{mute = Period, pinned = undefined} = Conversation]}]} = IQ) when Period /= undefined->
   iq_result(IQ, mute_conversation(LServer, LUser, Conversation));
 process_iq(IQ) ->
-  ?INFO_MSG("END",[]),
   xmpp:make_error(IQ, xmpp:err_bad_request()).
 
 iq_result(IQ,ok) ->
@@ -530,10 +531,9 @@ process_message(in,#message{type = chat, body = [], from = From, to = To, sub_el
 process_message(in,#message{id = _ID, type = chat, from = Peer, to = To, meta = #{stanza_id := TS}} = Pkt)->
   {LUser, LServer, _ } = jid:tolower(To),
   {PUser, PServer, _} = jid:tolower(Peer),
-  PktRefGrp = filter_reference(Pkt,<<"groupchat">>),
   Conversation = jid:to_string(jid:make(PUser,PServer)),
   Type = get_conversation_type(LServer,LUser,Conversation),
-  Invite = xmpp:get_subtag(PktRefGrp, #xabbergroupchat_invite{}),
+  Invite = xmpp:get_subtag(Pkt, #xabbergroupchat_invite{}),
   X = xmpp:get_subtag(Pkt, #xabbergroupchat_x{xmlns = ?NS_GROUPCHAT_SYSTEM_MESSAGE}),
   OriginIDElemnt = xmpp:get_subtag(Pkt, #origin_id{}),
   OriginID = get_origin_id(OriginIDElemnt),
@@ -550,12 +550,12 @@ process_message(in,#message{id = _ID, type = chat, from = Peer, to = To, meta = 
           Chat = jid:to_string(jid:remove_resource(ChatJID)),
           store_special_message_id(LServer,LUser,Chat,TS,OriginID,<<"invite">>),
           store_invite_information(LUser,LServer,ChatJID#jid.luser,ChatJID#jid.lserver, TS),
-          create_conversation(LServer,LUser,Chat,<<>>,false,?NS_GROUPCHAT),
+          create_conversation(LServer,LUser,Chat,<<>>,false,?NS_GROUPCHAT,<<>>),
           update_mam_prefs(add,To,ChatJID),
           ejabberd_hooks:run(xabber_push_notification, LServer, [<<"message">>, LUser, LServer,
             #stanza_id{id = integer_to_binary(TS), by = jid:remove_resource(To)}])
       end;
-    Type == <<"groupchat">>; Type == <<"channel">> ->
+    Type == ?NS_GROUPCHAT; Type == <<"channel">> ->
       FilPacket = filter_packet(Pkt,jid:remove_resource(Peer)),
       StanzaID = xmpp:get_subtag(FilPacket, #stanza_id{}),
       case StanzaID of
@@ -579,8 +579,8 @@ process_message(in,#message{id = _ID, type = chat, from = Peer, to = To, meta = 
       case check_voip_msg(Pkt) of
         false ->
           case body_is_encrypted(Pkt) of
-            true ->
-              create_conversation(LServer,LUser,Conversation,<<"">>,true),
+            {true, NS} ->
+              create_conversation(LServer,LUser,Conversation,<<"">>,true,NS,<<>>),
               update_metainfo(message, LServer,LUser,Conversation,TS,true);
             _ ->
               ejabberd_hooks:run(xabber_push_notification, LServer, [<<"message">>, LUser, LServer,
@@ -618,10 +618,10 @@ process_message(out, #message{id = ID, type = chat, from = #jid{luser =  LUser,l
   end,
   case Invite of
     false ->
-      Encrypted = xmpp:get_subtag(Pkt,#encrypted_message{}),
+      Encrypted = xmpp:get_subtag(Pkt,#encrypted_message_omemo{}),
       case Encrypted of
-        #encrypted_message{} ->
-          create_conversation(LServer,LUser,Conversation,<<"">>,true),
+        #encrypted_message_omemo{} ->
+          create_conversation(LServer,LUser,Conversation,<<"">>,true,<<"urn:xmpp:omemo:1">>,<<>>),
           update_metainfo(read, LServer,LUser,Conversation,TS,true);
         _ ->
           update_metainfo(message, LServer,LUser,Conversation,TS,false),
@@ -641,7 +641,7 @@ process_message(out, #message{type = chat, from = #jid{luser =  LUser,lserver = 
   Conversation = jid:to_string(jid:make(PUser,PServer)),
   Type = get_conversation_type(LServer,LUser,Conversation),
   case Displayed of
-    #message_displayed{id = OriginID} when Type == <<"groupchat">> ->
+    #message_displayed{id = OriginID} when Type == ?NS_GROUPCHAT ->
       FilPacket = filter_packet(Displayed,jid:make(PUser,PServer)),
       StanzaID = case xmpp:get_subtag(FilPacket, #stanza_id{}) of
                    #stanza_id{id = SID} ->
@@ -701,20 +701,31 @@ convert_result(Result) ->
   lists:map(fun(El) ->
     [Conversation,Retract,Type,Thread,
       Read,Delivered,Display,UpdateAt,
-      Status,Encrypted,Incognito,P2P,
-      Pinned,Mute] = El,
+      Status,Encrypted, Pinned,Mute, GroupInfo] = El,
+    GroupXelem = case binary:split(GroupInfo,<<$,>>) of
+                   [<<>>] ->
+                     [];
+                   [Privacy, Parent] ->
+                     [#xabbergroupchat_x{
+                       xmlns = ?NS_GROUPCHAT,
+                       parent = jid:from_string(Parent),
+                       sub_els = [#xabbergroupchat_privacy{cdata = Privacy}]}];
+                   [Privacy] ->
+                     [#xabbergroupchat_x{
+                       xmlns = ?NS_GROUPCHAT,
+                       sub_els = [#xabbergroupchat_privacy{cdata = Privacy}]}]
+                 end,
     {Conversation,binary_to_integer(Retract),Type,Thread,
       Read,Delivered,Display,binary_to_integer(UpdateAt),
-      binary_to_atom(Status,utf8),ejabberd_sql:to_bool(Encrypted),ejabberd_sql:to_bool(Incognito), ejabberd_sql:to_bool(P2P),
-      Pinned,binary_to_integer(Mute)} end, Result).
+      binary_to_atom(Status,utf8),ejabberd_sql:to_bool(Encrypted),
+      Pinned,binary_to_integer(Mute), GroupXelem} end, Result).
 
 make_result_el(LServer, LUser, El) ->
   {Conversation,Retract,Type,Thread,Read,
-    Delivered,Display,UpdateAt,ConversationStatus,Encrypted,Incognito,P2P,Pinned,Mute} = El,
+    Delivered,Display,UpdateAt,ConversationStatus,Encrypted,Pinned,Mute,GroupInfo} = El,
   ConversationMetadata = ejabberd_hooks:run_fold(syncronization_query,
-    LServer, [], [LUser,LServer,Conversation,Read,Delivered,Display,ConversationStatus,Retract,Type,Encrypted]),
-  ConversationType = define_type(Type,Encrypted,Incognito,P2P),
-  C = #xabber_conversation{stamp = integer_to_binary(UpdateAt), type = ConversationType, status = ConversationStatus,
+    LServer, [], [LUser,LServer,Conversation,Read,Delivered,Display,ConversationStatus,Retract,Type,Encrypted,GroupInfo]),
+  C = #xabber_conversation{stamp = integer_to_binary(UpdateAt), type = Type, status = ConversationStatus,
     thread = Thread, jid = jid:from_string(Conversation),sub_els = ConversationMetadata},
   Now = time_now() div 1000000,
   C2 = case  Mute of
@@ -726,29 +737,11 @@ make_result_el(LServer, LUser, El) ->
     P -> C2#xabber_conversation{pinned = P}
   end.
 
-define_type(Type,Encrypted,Incognito,P2P) ->
-  case Type of
-    <<"groupchat">> when Incognito == false andalso P2P == false ->
-      <<"group">>;
-    <<"groupchat">> when P2P =/= false ->
-      <<"private">>;
-    <<"groupchat">> when Incognito =/= false andalso P2P == false ->
-      <<"incognito">>;
-    _ when Encrypted =/= false ->
-      <<"encrypted">>;
-    _ ->
-      Type
-  end.
-
-check_conversation_type(_Acc,_LUser,_LServer,_Conversation,_Read,_Delivered,_Display,ConversationStatus,_Retract,_Type,_Encrypted) ->
-  case ConversationStatus of
-    deleted ->
-      {stop,[]};
-    _ ->
-      []
-  end.
-
-create_synchronization_metadata(Acc,LUser,LServer,Conversation,Read,Delivered,Display,_ConversationStatus,Retract,Type,Encrypted) ->
+create_synchronization_metadata(_Acc,_LUser,_LServer,_Conversation,
+    _Read,_Delivered,_Display,deleted,_Retract,_Type,_Encrypted,_GroupInfo) ->
+  {stop,[]};
+create_synchronization_metadata(Acc,LUser,LServer,Conversation,
+    Read,Delivered,Display,_ConversationStatus,Retract,Type,Encrypted,GroupInfo) ->
   {PUser, PServer,_} = jid:tolower(jid:from_string(Conversation)),
   IsLocal = lists:member(PServer,ejabberd_config:get_myhosts()),
   case Type of
@@ -783,7 +776,7 @@ create_synchronization_metadata(Acc,LUser,LServer,Conversation,Read,Delivered,Di
         #xabber_metadata{node = ?NS_JINGLE_MESSAGE,sub_els = LastCall},
         #xabber_metadata{node = ?NS_CHANNELS, sub_els = [UserCard]},
         #xabber_metadata{node = ?NS_XABBER_SYNCHRONIZATION, sub_els = SubEls}]};
-    <<"groupchat">> when IsLocal == true ->
+    ?NS_GROUPCHAT when IsLocal == true ->
       LastRead = get_groupchat_last_readed(PServer,PUser,LServer,LUser),
       User = jid:to_string(jid:make(LUser,LServer)),
       Chat = jid:to_string(jid:make(PUser,PServer)),
@@ -799,9 +792,9 @@ create_synchronization_metadata(Acc,LUser,LServer,Conversation,Read,Delivered,Di
       SubEls = [Unread, XabberDisplayed, XabberDelivered] ++ LastMessage,
       {stop,[#xabber_metadata{node = ?NS_XABBER_REWRITE, sub_els = [#xabber_conversation_retract{version = Retract}]},
         #xabber_metadata{node = ?NS_JINGLE_MESSAGE,sub_els = LastCall},
-        #xabber_metadata{node = ?NS_GROUPCHAT, sub_els = [UserCard]},
+        #xabber_metadata{node = ?NS_GROUPCHAT, sub_els = [UserCard] ++ GroupInfo},
         #xabber_metadata{node = ?NS_XABBER_SYNCHRONIZATION, sub_els = SubEls}]};
-    <<"groupchat">> when IsLocal == false ->
+    ?NS_GROUPCHAT when IsLocal == false ->
       Count = length(get_count(LUser, LServer, PUser, PServer)),
       UserCard = get_user_card(LUser, LServer, PUser, PServer),
       LastMessage = get_last_message(LUser, LServer, PUser, PServer),
@@ -812,7 +805,7 @@ create_synchronization_metadata(Acc,LUser,LServer,Conversation,Read,Delivered,Di
       SubEls = [Unread, XabberDisplayed, XabberDelivered] ++ LastMessage,
       {stop,[#xabber_metadata{node = ?NS_XABBER_REWRITE, sub_els = [#xabber_conversation_retract{version = Retract}]},
         #xabber_metadata{node = ?NS_JINGLE_MESSAGE,sub_els = LastCall},
-        #xabber_metadata{node = ?NS_GROUPCHAT, sub_els = UserCard},
+        #xabber_metadata{node = ?NS_GROUPCHAT, sub_els = UserCard ++ GroupInfo},
         #xabber_metadata{node = ?NS_XABBER_SYNCHRONIZATION, sub_els = SubEls}]};
     _ when Encrypted == true ->
       Count = get_count_encrypted_messages(LServer,LUser,Conversation,binary_to_integer(Read)),
@@ -899,7 +892,7 @@ store_last_call(Pkt, Peer, LUser, LServer, TS) ->
       case mnesia:transaction(F1) of
         {atomic, ok} ->
           Conversation = jid:to_string(jid:remove_resource(Peer)),
-          update_metainfo(<<"chat">>, LServer,LUser,Conversation,<<>>),
+          update_metainfo(?NS_XABBER_SYNCHRONIZATION_CHAT, LServer,LUser,Conversation,<<>>),
           ?DEBUG("Save call ~p to ~p~n TS ~p ",[LUser,Peer,TS]),
           ok;
         {aborted, Err1} ->
@@ -1243,36 +1236,22 @@ update_metainfo(<<"channel">>, LServer,LUser,Conversation,_X) ->
     ?SQL("update conversation_metadata set type = %(Type)s, metadata_updated_at = %(TS)d
     where username=%(LUser)s and conversation=%(Conversation)s and type != %(Type)s and %(LServer)H")
   );
-update_metainfo(<<"groupchat">>, LServer,LUser,Conversation,X) ->
-  Type = <<"groupchat">>,
+update_metainfo(?NS_GROUPCHAT, LServer,LUser,Conversation,X) ->
+  Type = ?NS_GROUPCHAT,
   Privacy = get_privacy(xmpp:get_subtag(X, #xabbergroupchat_privacy{})),
   Parent = X#xabbergroupchat_x.parent,
-  case Privacy of
-    <<"incognito">> when Parent == undefined ->
-      TS = time_now(),
-      ejabberd_sql:sql_query(
-        LServer,
-        ?SQL("update conversation_metadata set type = %(Type)s, metadata_updated_at = %(TS)d,  incognito = 'true'
-    where username=%(LUser)s and conversation=%(Conversation)s and type != %(Type)s and %(LServer)H")
-      );
-    _ when Parent =/= undefined ->
-      TS = time_now(),
-      ejabberd_sql:sql_query(
-        LServer,
-        ?SQL("update conversation_metadata set type = %(Type)s, metadata_updated_at = %(TS)d,  p2p = 'true'
-    where username=%(LUser)s and conversation=%(Conversation)s and type != %(Type)s and %(LServer)H")
-      );
-    _ ->
-      TS = time_now(),
-      ejabberd_sql:sql_query(
-        LServer,
-        ?SQL("update conversation_metadata set type = %(Type)s, metadata_updated_at = %(TS)d,
-        p2p = 'false', incognito = 'false'
-    where username=%(LUser)s and conversation=%(Conversation)s and type != %(Type)s and %(LServer)H")
-      )
-  end;
-update_metainfo(<<"chat">>, LServer,LUser,Conversation,_StanzaID) ->
-  Type = <<"chat">>,
+  GroupInfo = case Parent of
+                undefined -> Privacy;
+                _ -> <<Privacy/binary,$,,(jid:to_string(Parent))/binary>>
+              end,
+  TS = time_now(),
+  ejabberd_sql:sql_query(
+    LServer,
+    ?SQL("update conversation_metadata
+     set type = %(Type)s, metadata_updated_at = %(TS)d, group_info = %(GroupInfo)s
+     where username=%(LUser)s and conversation=%(Conversation)s and type != %(Type)s and %(LServer)H"));
+update_metainfo(?NS_XABBER_SYNCHRONIZATION_CHAT, LServer,LUser,Conversation,_StanzaID) ->
+  Type = ?NS_XABBER_SYNCHRONIZATION_CHAT,
   ?DEBUG("save chat ~p ~p",[LUser,Conversation]),
   TS = time_now(),
  ejabberd_sql:sql_query(
@@ -1505,7 +1484,7 @@ get_count_encrypted_messages(LServer,LUser,PUser,TS) ->
       0
   end.
 
-get_last_groupchat_message(LServer,LUser,Status,User) ->
+get_last_groupchat_message(LServer,LUser,<<"both">>,User) ->
   Chat = jid:to_string(jid:make(LUser,LServer)),
   case ejabberd_sql:sql_query(
     LServer,
@@ -1513,13 +1492,14 @@ get_last_groupchat_message(LServer,LUser,Status,User) ->
     @(timestamp)d, @(xml)s, @(peer)s, @(kind)s, @(nick)s
      from archive"
     " where username=%(LUser)s  and txt notnull and txt !='' and %(LServer)H order by timestamp desc limit 1")) of
-    {selected,[<<>>]} ->
-      get_invite(LServer,User,Chat);
-    {selected,[{TS, XML, Peer, Kind, Nick}]} when Status == <<"both">> ->
+    {selected,[{TS, XML, Peer, Kind, Nick}]} ->
       convert_message(TS, XML, Peer, Kind, Nick, LUser, LServer);
     _ ->
       get_invite(LServer,User,Chat)
-  end.
+  end;
+get_last_groupchat_message(LServer,LUser,_Status,User) ->
+  Chat = jid:to_string(jid:make(LUser,LServer)),
+  get_invite(LServer,User,Chat).
 
 get_invite(LServer,LUser,Chat) ->
   case ejabberd_sql:sql_query(
@@ -1643,7 +1623,7 @@ handle_sub_els(chat, [#message_displayed{id = OriginID} = Displayed], From, To) 
   Type = get_conversation_type(LServer,LUser,Conversation),
   PeerJID = jid:make(PUser,PServer),
   case Type of
-    <<"groupchat">> ->
+    ?NS_GROUPCHAT ->
       Displayed2= filter_packet(Displayed,PeerJID),
       StanzaID = get_stanza_id(Displayed2,PeerJID,LServer,OriginID),
       update_metainfo(displayed, LServer,LUser,Conversation,StanzaID);
@@ -1820,26 +1800,6 @@ filter_packet(Pkt,BareJID) ->
     end, Els),
   xmpp:set_els(Pkt, NewEls).
 
-filter_reference(Pkt,Type) ->
-  Els = xmpp:get_els(Pkt),
-  NewEls = lists:filtermap(
-    fun(El) ->
-      Name = xmpp:get_name(El),
-      NS = xmpp:get_ns(El),
-      if (Name == <<"reference">> andalso NS == ?NS_REFERENCE_0) ->
-        try xmpp:decode(El) of
-          #xmppreference{type = TypeRef} ->
-            TypeRef == Type
-        catch _:{xmpp_codec, _} ->
-          false
-        end;
-        true ->
-          true
-      end
-    end, Els),
-  xmpp:set_els(Pkt, NewEls).
-
-
 time_now() ->
   {MSec, Sec, USec} = erlang:timestamp(),
   (MSec*1000000 + Sec)*1000000 + USec.
@@ -1897,10 +1857,9 @@ make_sql_query(LServer, User, TS, RSM, Form) ->
   updated_at,
   status,
   encrypted,
-  incognito,
-  p2p,
   pinned,
-  mute
+  mute,
+  group_info
   from conversation_metadata where username = '">>,SUser,<<"' and
   metadata_updated_at > '">>,Timestamp,<<"'">>] ++ DeleteClause,
   PageClause = case Chat of
@@ -1928,11 +1887,11 @@ make_sql_query(LServer, User, TS, RSM, Form) ->
       before ->
         [<<"SELECT * FROM (">>, Query,
           <<" GROUP BY conversation, retract, type, conversation_thread, read_until, delivered_until, displayed_until,
-  updated_at, status, encrypted, pinned, mute, incognito, p2p ORDER BY updated_at ASC ">>,
+  updated_at, status, encrypted, pinned, mute, group_info ORDER BY updated_at ASC ">>,
           LimitClause, <<") AS c ORDER BY ">>, PinnedFirstClause ,<<" updated_at DESC;">>];
       _ ->
         [Query, <<" GROUP BY conversation, retract, type, conversation_thread, read_until,
-        delivered_until,  displayed_until, updated_at, status, encrypted, pinned, mute, incognito, p2p
+        delivered_until,  displayed_until, updated_at, status, encrypted, pinned, mute, group_info
         ORDER BY ">>, PinnedFirstClause ,<<" updated_at DESC ">>,
           LimitClause, <<";">>]
     end,
@@ -1941,11 +1900,11 @@ make_sql_query(LServer, User, TS, RSM, Form) ->
       {QueryPage,[<<"SELECT COUNT(*) FROM (">>,Conversations,<<" and server_host='">>,
         SServer, <<"' ">>,
         <<" GROUP BY conversation, retract, type, conversation_thread, read_until, delivered_until,
-        displayed_until, updated_at, status, encrypted, pinned, mute, incognito, p2p) as subquery;">>]};
+        displayed_until, updated_at, status, encrypted, pinned, mute, group_info) as subquery;">>]};
     false ->
       {QueryPage,[<<"SELECT COUNT(*) FROM (">>,Conversations,
         <<" GROUP BY conversation, retract, type, conversation_thread, read_until, delivered_until,
-        displayed_until, updated_at, status, encrypted, pinned, mute, incognito, p2p) as subquery;">>]}
+        displayed_until, updated_at, status, encrypted, pinned, mute, group_info) as subquery;">>]}
   end.
 
 
@@ -2073,7 +2032,6 @@ activate_conversation(_, _, _) ->
 %%  end.
 
 delete_conversation(LServer,LUser,#xabber_conversation{type = Type, jid = JID}) ->
-  ?INFO_MSG("delete_conversation",[]),
   Conversation = jid:to_string(jid:remove_resource(JID)),
   TS = time_now(),
   case ejabberd_sql:sql_query(
@@ -2111,7 +2069,7 @@ maybe_delete_invite_and_conversation(LUser,LServer,PUser,PServer) ->
   Conversation = jid:to_string(jid:make(PUser,PServer)),
   Type = get_conversation_type(LServer,LUser,Conversation),
   case Type of
-    <<"groupchat">> ->
+    ?NS_GROUPCHAT ->
       Invites = get_invite_information(LUser,LServer,PUser,PServer),
       lists:foreach(fun(Invite) ->
         delete_invite(Invite) end, Invites
@@ -2152,16 +2110,7 @@ make_ccc_push(LServer,LUser,Conversation, TS, Type, Thread, PushType) ->
     ejabberd_router:route(IQ)
                 end, UserResources).
 
-create_conversation(LServer,LUser,Conversation,Thread,Encrypted) ->
-  create_conversation(LServer,LUser,Conversation,Thread,Encrypted,<<"chat">>).
-
-create_conversation(LServer,LUser,Conversation,Thread,Encrypted,Type0) ->
-  {Type, Incognito} = case binary:split(Type0, <<$#>>) of
-                        [?NS_GROUPCHAT] -> {<<"groupchat">>, false};
-                        [?NS_GROUPCHAT,<<"public">>] -> {<<"groupchat">>,false};
-                        [?NS_GROUPCHAT,<<"incognito">>] -> {<<"groupchat">>, true};
-                        [Val] -> {Val, false}
-                      end,
+create_conversation(LServer,LUser,Conversation,Thread,Encrypted,Type,GroupInfo) ->
   TS = time_now(),
   Status = <<"active">>,
   ?SQL_UPSERT(
@@ -2175,7 +2124,7 @@ create_conversation(LServer,LUser,Conversation,Thread,Encrypted,Type0) ->
       "conversation_thread=%(Thread)s",
       "metadata_updated_at=%(TS)d",
       "status=%(Status)s",
-      "incognito=%(Incognito)b",
+      "group_info=%(GroupInfo)s",
       "server_host=%(LServer)s"]).
 
 get_and_store_user_card(LServer,LUser,PeerJID,Message) ->
@@ -2252,7 +2201,10 @@ get_user_card(LUser, LServer, PUser, PServer) ->
 
 -spec body_is_encrypted(message()) -> boolean().
 body_is_encrypted(#message{sub_els = SubEls}) ->
-  lists:keyfind(<<"encrypted">>, #xmlel.name, SubEls) /= false.
+  case lists:keyfind(<<"encrypted">>, #xmlel.name, SubEls) of
+    false -> false;
+    #encrypted_message_omemo{} -> {true, <<"urn:xmpp:omemo:1">>}
+  end.
 
 maybe_change_last_msg(LServer, LUser, ConversationJID, Replace) ->
   {PUser, PServer, _PRes} = jid:tolower(ConversationJID),
